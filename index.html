@@ -23,7 +23,10 @@
     font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans Devanagari", sans-serif;
     max-width: 460px; margin-inline: auto;
   }
-  h1 { font-size: 20px; margin: 4px 0 12px; }
+  .top { display: flex; justify-content: space-between; align-items: baseline; margin: 4px 0 12px; }
+  h1 { font-size: 20px; margin: 0; }
+  #sync { font-size: 13px; color: var(--muted); }
+  #sync.pending { color: #8a5a00; font-weight: 600; }
   #reader { width: 100%; border-radius: 12px; overflow: hidden; background: #000; min-height: 120px; }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-top: 14px; }
   .hidden { display: none !important; }
@@ -43,13 +46,15 @@
   button:disabled { opacity: .5; }
   button:focus-visible, input:focus-visible { outline: 3px solid #f2b705; outline-offset: 2px; }
   label { display: block; font-size: 14px; color: var(--muted); margin-top: 10px; }
-  input {
+  input[type=text], input[type=number], input[inputmode] {
     width: 100%; padding: 12px; font-size: 16px; border: 1.5px solid var(--line);
     border-radius: 10px; margin-top: 4px; background: #fff; color: var(--ink);
   }
   .manual { display: flex; gap: 8px; margin-top: 12px; }
   .manual input { margin: 0; }
   .manual button { width: auto; margin: 0; padding: 12px 18px; }
+  .auto { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 15px; color: var(--ink); }
+  .auto input { width: 20px; height: 20px; margin: 0; }
   #msg { margin-top: 12px; padding: 12px; border-radius: 10px; font-size: 15px; background: #dff3e8; color: #0d5a34; }
   #msg.err { background: #fbe3e1; color: var(--warn); }
   .notice { color: var(--muted); font-size: 14px; margin: 8px 2px 0; }
@@ -57,7 +62,10 @@
 </head>
 <body>
 
-<h1>दुकान स्कैनर</h1>
+<div class="top">
+  <h1>दुकान स्कैनर</h1>
+  <span id="sync">…</span>
+</div>
 
 <div id="reader"></div>
 
@@ -65,6 +73,8 @@
   <input id="manualCode" inputmode="numeric" placeholder="बारकोड हाथ से डालें" aria-label="बारकोड">
   <button id="manualBtn" type="button">खोजें</button>
 </div>
+
+<label class="auto"><input type="checkbox" id="auto" checked> बिक्री के बाद अपने-आप अगला स्कैन</label>
 
 <div id="msg" class="hidden" role="status"></div>
 
@@ -86,7 +96,7 @@
   <p class="name">यह बारकोड नया है</p>
   <p class="code" id="nCode"></p>
   <label for="nName">आइटम का नाम</label>
-  <input id="nName" placeholder="जैसे: Kurti">
+  <input id="nName" type="text" placeholder="जैसे: Kurti">
   <label for="nPrice">कीमत (₹)</label>
   <input id="nPrice" type="number" inputmode="decimal" min="0">
   <label for="nStock">कितने पीस हैं</label>
@@ -98,23 +108,55 @@
 <p class="notice">कैमरा चालू न हो तो ब्राउज़र में कैमरा अनुमति दें। ऐप https लिंक पर खुलना चाहिए।</p>
 
 <script>
-  // ⬇️ यहाँ अपना Apps Script वाला Web App URL पेस्ट करें (उद्धरण चिह्नों के अंदर)
+  // ⬇️ अपना Apps Script वाला Web App URL (नई deployment के बाद भी वही रहेगा)
   const WEB_APP_URL = "https://script.google.com/macros/s/AKfycbx_F-Vvvayt56mpLK0hUI6TR5kVSINvis5ES8wXgcif3oTgaKECbSTd0tSaCHDjRnutKQ/exec";
 
+  const LS_ITEMS = "dukan_items_v1";
+  const LS_QUEUE = "dukan_queue_v1";
+  const LS_AUTO  = "dukan_auto_v1";
+
   const $ = (id) => document.getElementById(id);
+
+  /* ---------- स्थिति (state) ---------- */
+  let items = {};            // barcode -> {barcode,itemName,price,stock}  (फोन की अपनी कॉपी)
+  let queue = [];            // सर्वर को भेजने बाकी बदलाव
+  let loaded = false;        // क्या पूरा डेटा एक बार आ चुका है
+  let version = 0;           // हर बदलाव पर +1, ताकि पुराना sync नया डेटा न मिटाए
+  let sending = false;
   let scanner = null;
+  let scanning = false;
+  let locked = false;        // एक स्कैन चल रहा है
   let currentCode = "";
-  let busy = false;
+
+  try { items = JSON.parse(localStorage.getItem(LS_ITEMS) || "{}"); } catch (e) { items = {}; }
+  try { queue = JSON.parse(localStorage.getItem(LS_QUEUE) || "[]"); } catch (e) { queue = []; }
+  try { $("auto").checked = localStorage.getItem(LS_AUTO) !== "0"; } catch (e) {}
+  loaded = Object.keys(items).length > 0;
+
+  function saveItems() { try { localStorage.setItem(LS_ITEMS, JSON.stringify(items)); } catch (e) {} }
+  function saveQueue() {
+    try { localStorage.setItem(LS_QUEUE, JSON.stringify(queue)); } catch (e) {}
+    updateSyncUI();
+  }
+  $("auto").onchange = () => { try { localStorage.setItem(LS_AUTO, $("auto").checked ? "1" : "0"); } catch (e) {} };
+
+  function updateSyncUI() {
+    const s = $("sync");
+    if (queue.length) { s.textContent = "⏳ " + queue.length + " भेजना बाकी"; s.className = "pending"; }
+    else if (loaded)  { s.textContent = "✓ सब सेव"; s.className = ""; }
+    else              { s.textContent = "डेटा लोड हो रहा…"; s.className = ""; }
+  }
 
   /* ---------- छोटे हेल्पर ---------- */
-  function beep(freq = 880, ms = 120) {
+  let audioCtx = null;
+  function beep(freq = 880, ms = 100) {
     try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const o = ctx.createOscillator();
-      o.frequency.value = freq; o.connect(ctx.destination); o.start();
-      setTimeout(() => { o.stop(); ctx.close(); }, ms);
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      const o = audioCtx.createOscillator();
+      o.frequency.value = freq; o.connect(audioCtx.destination); o.start();
+      o.stop(audioCtx.currentTime + ms / 1000);
     } catch (e) {}
-    if (navigator.vibrate) navigator.vibrate(60);
+    if (navigator.vibrate) navigator.vibrate(50);
   }
 
   function showMsg(text, isErr) {
@@ -124,81 +166,130 @@
     m.classList.remove("hidden");
   }
   function clearMsg() { $("msg").classList.add("hidden"); }
-
-  function hideCards() {
-    $("itemCard").classList.add("hidden");
-    $("newCard").classList.add("hidden");
-  }
+  function hideCards() { $("itemCard").classList.add("hidden"); $("newCard").classList.add("hidden"); }
 
   async function api(params) {
-    if (WEB_APP_URL.indexOf("YAHAN") !== -1) {
-      throw new Error("pehle index.html me WEB_APP_URL daalein");
-    }
     const res = await fetch(WEB_APP_URL + "?" + new URLSearchParams(params).toString());
     return await res.json();
   }
 
-  /* ---------- स्कैनर ---------- */
+  /* ---------- सर्वर को बदलाव भेजना (background) ---------- */
+  function enqueue(params) {
+    params.opid = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    queue.push(params);
+    version++;
+    saveQueue();
+    processQueue();
+  }
+
+  async function processQueue() {
+    if (sending) return;
+    sending = true;
+    try {
+      while (queue.length) {
+        let d;
+        try { d = await api(queue[0]); }
+        catch (e) { setTimeout(processQueue, 5000); return; }          // नेट नहीं: बाद में फिर कोशिश
+        if (d.status === "busy") { setTimeout(processQueue, 2000); return; }
+        if (d.status === "no_stock" || d.status === "error") {
+          showMsg("सर्वर पर एक बदलाव नहीं हुआ: " + (d.message || ""), true);
+        }
+        queue.shift();
+        saveQueue();
+      }
+    } finally {
+      sending = false;
+    }
+    syncAll();
+  }
+
+  /* ---------- सर्वर से पूरा डेटा लेना ---------- */
+  async function syncAll() {
+    if (queue.length || sending) return;
+    const v = version;
+    try {
+      const d = await api({ action: "all" });
+      if (d.status === "success" && queue.length === 0 && v === version) {
+        const m = {};
+        d.items.forEach((it) => { m[it.barcode] = it; });
+        items = m;
+        saveItems();
+        loaded = true;
+        updateSyncUI();
+        if (currentCode && items[currentCode] && !$("itemCard").classList.contains("hidden")) {
+          renderItem(items[currentCode]);
+        }
+      }
+    } catch (e) {}
+  }
+
+  /* ---------- स्कैनर (कैमरा बंद नहीं होता, सिर्फ pause/resume) ---------- */
   async function startScanner() {
-    clearMsg();
-    hideCards();
-    currentCode = "";
-    busy = false;
+    if (scanning) return;
     const F = Html5QrcodeSupportedFormats;
     scanner = new Html5Qrcode("reader", {
       formatsToSupport: [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_128, F.CODE_39, F.ITF, F.QR_CODE],
       useBarCodeDetectorIfSupported: true,
+      experimentalFeatures: { useBarCodeDetectorIfSupported: true },
       verbose: false
     });
     try {
       await scanner.start(
         { facingMode: "environment" },
-        {
-          fps: 12,
-          qrbox: (w, h) => ({ width: Math.floor(w * 0.85), height: Math.floor(Math.min(h * 0.5, 160)) })
-        },
+        { fps: 15, qrbox: (w, h) => ({ width: Math.floor(w * 0.85), height: Math.floor(Math.min(h * 0.5, 160)) }) },
         onScan,
         () => {}
       );
+      scanning = true;
     } catch (err) {
+      scanning = false;
       showMsg("कैमरा शुरू नहीं हुआ। अनुमति दें, या नीचे हाथ से बारकोड डालें।", true);
     }
   }
 
-  async function stopScanner() {
-    try { if (scanner && scanner.isScanning) await scanner.stop(); } catch (e) {}
+  function pauseScan() { try { if (scanner && scanning) scanner.pause(true); } catch (e) {} }
+  function resumeScan() {
+    locked = false;
+    if (!scanning) { startScanner(); return; }
+    try { scanner.resume(); } catch (e) {}
   }
 
-  async function onScan(text) {
-    if (busy) return;
-    busy = true;
+  function onScan(text) {
+    if (locked) return;
+    locked = true;
     beep();
-    await stopScanner();
-    lookup(text.trim());
+    pauseScan();
+    lookup(String(text).trim());
   }
 
-  /* ---------- खोज और दिखाना ---------- */
+  /* ---------- खोज (अब फोन के अंदर से, तुरंत) ---------- */
   async function lookup(code) {
     currentCode = code;
     hideCards();
-    showMsg("खोज रहे हैं…");
-    try {
-      const d = await api({ barcode: code, action: "get" });
-      if (d.status === "success") {
+    clearMsg();
+    let it = items[code];
+
+    // पहली बार, डेटा अभी आया नहीं: सर्वर से सीधे पूछो
+    if (!it && !loaded) {
+      showMsg("खोज रहे हैं…");
+      try {
+        const d = await api({ barcode: code, action: "get" });
         clearMsg();
-        renderItem(d.item);
-      } else if (d.status === "not_found") {
-        clearMsg();
-        $("nCode").textContent = "बारकोड: " + code;
-        $("nName").value = ""; $("nPrice").value = ""; $("nStock").value = "";
-        $("newCard").classList.remove("hidden");
-      } else {
-        showMsg(d.message || "कुछ गड़बड़ हुई", true);
+        if (d.status === "success") { it = d.item; items[code] = it; saveItems(); }
+      } catch (e) {
+        showMsg("नेट नहीं है और डेटा अभी लोड नहीं हुआ।", true);
+        setTimeout(() => { clearMsg(); resumeScan(); }, 1800);
+        return;
       }
-    } catch (err) {
-      showMsg("कनेक्शन में दिक्कत: " + err.message, true);
     }
-    busy = false;
+
+    if (it) {
+      renderItem(it);
+    } else {
+      $("nCode").textContent = "बारकोड: " + code;
+      $("nName").value = ""; $("nPrice").value = ""; $("nStock").value = "";
+      $("newCard").classList.remove("hidden");
+    }
   }
 
   function renderItem(item) {
@@ -211,49 +302,38 @@
     $("itemCard").classList.remove("hidden");
   }
 
-  /* ---------- बटन ---------- */
-  $("sellBtn").onclick = async () => {
-    if (busy || !currentCode) return;
-    busy = true; $("sellBtn").disabled = true;
-    try {
-      const d = await api({ barcode: currentCode, action: "sell" });
-      if (d.status === "success") {
-        renderItem(d.item);
-        showMsg("बिक्री दर्ज हो गई। अब स्टॉक: " + d.item.stock);
-        beep(1200, 150);
-      } else if (d.status === "no_stock") {
-        renderItem(d.item);
-        showMsg("स्टॉक खत्म है, बिक्री दर्ज नहीं हुई।", true);
-      } else {
-        showMsg(d.message || "कुछ गड़बड़ हुई", true);
-      }
-    } catch (err) {
-      showMsg("कनेक्शन में दिक्कत: " + err.message, true);
+  /* ---------- बटन (सब तुरंत, सर्वर बाद में) ---------- */
+  $("sellBtn").onclick = () => {
+    const it = items[currentCode];
+    if (!it || it.stock <= 0) return;
+    it.stock -= 1;
+    saveItems();
+    enqueue({ barcode: currentCode, action: "sell", qty: 1 });
+    beep(1200, 90);
+    const low = it.stock <= 2 ? " ⚠ स्टॉक कम" : "";
+    if ($("auto").checked) {
+      hideCards();
+      showMsg("✓ बिक्री: " + it.itemName + " — बचा " + it.stock + low, it.stock <= 2);
+      resumeScan();
+    } else {
+      renderItem(it);
+      showMsg("बिक्री दर्ज हो गई। अब स्टॉक: " + it.stock + low, it.stock <= 2);
     }
-    busy = false;
   };
 
-  $("addBtn").onclick = async () => {
-    if (busy || !currentCode) return;
+  $("addBtn").onclick = () => {
+    const it = items[currentCode];
+    if (!it) return;
     const q = parseInt(prompt("कितने पीस जोड़ने हैं?", "1"), 10);
     if (!q || q < 1) return;
-    busy = true;
-    try {
-      const d = await api({ barcode: currentCode, action: "add", qty: q });
-      if (d.status === "success") {
-        renderItem(d.item);
-        showMsg("स्टॉक जुड़ गया। अब स्टॉक: " + d.item.stock);
-      } else {
-        showMsg(d.message || "कुछ गड़बड़ हुई", true);
-      }
-    } catch (err) {
-      showMsg("कनेक्शन में दिक्कत: " + err.message, true);
-    }
-    busy = false;
+    it.stock += q;
+    saveItems();
+    enqueue({ barcode: currentCode, action: "add", qty: q });
+    renderItem(it);
+    showMsg("स्टॉक जुड़ गया। अब स्टॉक: " + it.stock);
   };
 
-  $("saveNewBtn").onclick = async () => {
-    if (busy) return;
+  $("saveNewBtn").onclick = () => {
     const name = $("nName").value.trim();
     const price = $("nPrice").value;
     const stock = $("nStock").value;
@@ -261,36 +341,37 @@
       showMsg("नाम, कीमत और स्टॉक तीनों भरें।", true);
       return;
     }
-    busy = true;
-    try {
-      const d = await api({ barcode: currentCode, action: "new", name: name, price: price, stock: stock });
-      if (d.status === "success") {
-        $("newCard").classList.add("hidden");
-        renderItem(d.item);
-        showMsg("नया आइटम जुड़ गया।");
-      } else {
-        showMsg(d.message || "कुछ गड़बड़ हुई", true);
-      }
-    } catch (err) {
-      showMsg("कनेक्शन में दिक्कत: " + err.message, true);
-    }
-    busy = false;
+    const item = { barcode: currentCode, itemName: name, price: Number(price), stock: Number(stock) };
+    items[currentCode] = item;
+    saveItems();
+    enqueue({ barcode: currentCode, action: "new", name: name, price: price, stock: stock });
+    $("newCard").classList.add("hidden");
+    renderItem(item);
+    showMsg("नया आइटम जुड़ गया।");
   };
 
-  $("cancelNewBtn").onclick = () => startScanner();
-  $("nextBtn").onclick = () => startScanner();
+  function next() { hideCards(); clearMsg(); currentCode = ""; resumeScan(); }
+  $("cancelNewBtn").onclick = next;
+  $("nextBtn").onclick = next;
 
-  $("manualBtn").onclick = async () => {
+  $("manualBtn").onclick = () => {
     const code = $("manualCode").value.trim();
-    if (!code || busy) return;
-    busy = true;
-    await stopScanner();
+    if (!code || locked) return;
+    locked = true;
+    pauseScan();
     $("manualCode").value = "";
     lookup(code);
   };
   $("manualCode").addEventListener("keydown", (e) => { if (e.key === "Enter") $("manualBtn").click(); });
 
+  /* ---------- शुरुआत ---------- */
+  updateSyncUI();
   startScanner();
+  processQueue();      // पिछली बार जो बदलाव बाकी रह गए थे
+  syncAll();           // ताज़ा डेटा
+  setInterval(syncAll, 60000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) { processQueue(); syncAll(); } });
+  window.addEventListener("online", () => { processQueue(); syncAll(); });
 </script>
 </body>
-</html>
+  </html>
